@@ -40,6 +40,49 @@
 #endif
 #include "cutlass/util/helper_cuda.hpp"
 
+// Extra includes
+/// collective builder
+// #include "cutlass/util/command_line.h"
+// #include "cutlass/kernel_hardware_info.hpp"
+
+// #include "cutlass/cutlass.h"
+// #include "cutlass/tensor_ref.h"
+// #include "cutlass/epilogue/collective/default_epilogue.hpp"
+// #include "cutlass/epilogue/thread/linear_combination.h"
+// #include "cutlass/gemm/dispatch_policy.hpp"
+// #include "cutlass/gemm/collective/collective_builder.hpp"
+// #include "cutlass/epilogue/collective/collective_builder.hpp"
+// #include "cutlass/gemm/device/gemm_universal_adapter.h"
+// #include "cutlass/gemm/kernel/gemm_universal.hpp"
+// #include "cutlass/gemm/kernel/tile_scheduler.hpp"
+
+// #include "cutlass/util/command_line.h"
+// #include "cutlass/util/distribution.h"
+// #include "cutlass/util/host_tensor.h"
+// #include "cutlass/util/packed_stride.hpp"
+// #include "cutlass/util/tensor_view_io.h"
+// #include "cutlass/util/reference/device/gemm_complex.h"
+// #include "cutlass/util/reference/device/tensor_compare.h"
+// #include "cutlass/util/reference/device/tensor_fill.h"
+//// from example 47
+#include <iostream>
+#include <string>
+
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm/device/gemm_universal.h"
+
+#include "cutlass/util/command_line.h"
+#include "cutlass/util/host_tensor.h"
+#include "cutlass/util/reference/device/gemm.h"
+#include "cutlass/util/reference/host/tensor_compare.h"
+#include "cutlass/util/reference/host/tensor_copy.h"
+#include "cutlass/util/reference/host/tensor_fill.h"
+#include "cutlass/util/tensor_view_io.h"
+
+#include "helper.h"
+// Extra includes end
+
+
 template <class MShape, class NShape, class KShape,
           class TA, class AStride, class ABlockLayout, class AThreadLayout,
           class TB, class BStride, class BBlockLayout, class BThreadLayout,
@@ -406,21 +449,421 @@ void test_gemm(int m, int n, int k)
 }
 
 
-int main(int argc, char** argv)
+
+// TODO: use collective builder
+/*
+// template<
+// class MainloopScheduleType = cutlass::gemm::collective::KernelScheduleAuto,
+// class EpilogueScheduleType = cutlass::epilogue::collective::EpilogueScheduleAuto,
+// class StageCountType = cutlass::gemm::collective::StageCountAuto,
+// class TileSchedulerType = cutlass::gemm::PersistentScheduler
+// >
+// struct GemmRunner {
+//   using LayoutA = cutlass::layout::RowMajor;
+//   using LayoutB = cutlass::layout::ColumnMajor;
+//   using LayoutC = cutlass::layout::ColumnMajor;
+//   using LayoutD = cutlass::layout::ColumnMajor;
+
+//   using ElementA = cutlass::half_t;
+//   using ElementB = cutlass::half_t;
+//   using ElementC = cutlass::half_t;
+//   using ElementD = cutlass::half_t;
+//   using ElementAccumulator = float;
+//   using ElementCompute = float;
+//   using ElementScalar = float;
+
+//   // 16B align ony for TMA?
+//   static constexpr int AlignmentA = 16 / sizeof(ElementA);
+//   static constexpr int AlignmentB = 16 / sizeof(ElementB);
+//   static constexpr int AlignmentC = 16 / sizeof(ElementC);
+//   static constexpr int AlignmentD = 16 / sizeof(ElementD);
+
+//   // Epilogue collective has sm80?
+//   using CollectiveEpilogue = typename cutlass::epilogue::collective::DefaultEpilogue
+
+// }
+*/
+
+
+// A matrix
+using ElementA = cutlass::half_t;
+using LayoutA = cutlass::layout::RowMajor;
+constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+// B matrix
+using ElementB = cutlass::half_t;
+using LayoutB = cutlass::layout::ColumnMajor;
+constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+// C matrix
+using ElementC = cutlass::half_t;
+using LayoutC = cutlass::layout::ColumnMajor;
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+
+// Multiply-accumulate blocking/pipelining details
+using ElementAccumulator = float;
+using ArchTag = cutlass::arch::Sm80;
+using OperatorClass = cutlass::arch::OpClassTensorOp;
+
+using ThreadblockShape = cutlass::gemm::GemmShape<256, 128, 32>;
+using WarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
+using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+constexpr int NumStages = 3;
+
+// Epilogue
+using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
+  ElementC,
+  AlignmentC,
+  ElementAccumulator,
+  ElementAccumulator>;
+
+using DeviceGemmReference = cutlass::reference::device::Gemm<
+  ElementA,
+  LayoutA,
+  ElementB,
+  LayoutB,
+  ElementC,
+  LayoutC,
+  ElementAccumulator,
+  ElementAccumulator>;
+// Matching profiler generated GEMM
+// cutlass::arch::OpMultiplyAdd?
+// typename cutlass::gemm::kernel::DefaultGemmUniversal
+using DeviceGemmTest = cutlass::gemm::device::GemmUniversal<
+ElementA, LayoutA,
+ElementB, LayoutB,
+ElementC, LayoutC,
+ElementAccumulator,
+OperatorClass,
+ArchTag,
+ThreadblockShape,
+WarpShape,
+InstructionShape,
+EpilogueOp,
+cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>,
+NumStages,
+AlignmentA,
+AlignmentB,
+cutlass::arch::OpMultiplyAdd>;
+
+struct Result
 {
-  int m = 5120;
-  if (argc >= 2)
-    sscanf(argv[1], "%d", &m);
+  double avg_runtime_ms;
+  double gflops;
+  cutlass::Status status;
+  cudaError_t error;
+  bool passed;
 
-  int n = 5120;
-  if (argc >= 3)
-    sscanf(argv[2], "%d", &n);
+  Result(
+    double avg_runtime_ms = 0,
+    double gflops = 0,
+    cutlass::Status status = cutlass::Status::kSuccess,
+    cudaError_t error = cudaSuccess)
+  :
+    avg_runtime_ms(avg_runtime_ms), gflops(gflops), status(status), error(error), passed(true)
+  {}
 
-  int k = 4096;
-  if (argc >= 4)
-    sscanf(argv[3], "%d", &k);
+};
 
-  test_gemm(m, n, k);
+
+/// Command line options parsing
+struct Options
+{
+  std::string               command_name;
+  bool                      help;
+  cutlass::gemm::GemmCoord  problem_size;
+  float                     alpha;
+  float                     beta;
+  int                       split_k_factor;
+  int                       avail_sms;
+  bool                      reference_check;
+  int                       iterations;
+
+  cutlass::HostTensor<ElementA, LayoutA> tensor_a;
+  cutlass::HostTensor<ElementB, LayoutB> tensor_b;
+  cutlass::HostTensor<ElementC, LayoutC> tensor_c;
+  cutlass::HostTensor<ElementC, LayoutC> tensor_d;
+  cutlass::HostTensor<ElementC, LayoutC> tensor_ref_d;
+
+  Options(std::string command_name) :
+    command_name(command_name),
+    help(false),
+    problem_size({512, 6144, 12288}),
+    alpha(1.0f),
+    beta(0.0f),
+    split_k_factor(1),
+    avail_sms(-1),              // Number of device SMs to use is unlimited
+    reference_check(true),
+    iterations(10000)
+  {}
+
+  bool valid() const
+  {
+    return true;
+  }
+
+  void parse(int argc, char const **args)
+  {
+    cutlass::CommandLine cmd(argc, args);
+
+    if (cmd.check_cmd_line_flag("help")) {
+      help = true;
+    }
+
+    cmd.get_cmd_line_argument("m", problem_size.m());
+    cmd.get_cmd_line_argument("n", problem_size.n());
+    cmd.get_cmd_line_argument("k", problem_size.k());
+    cmd.get_cmd_line_argument("alpha", alpha);
+    cmd.get_cmd_line_argument("beta", beta);
+    cmd.get_cmd_line_argument("split", split_k_factor);
+    cmd.get_cmd_line_argument("iterations", iterations);
+  }
+
+  /// Prints the usage statement.
+  std::ostream & print_usage(std::ostream &out) const
+  {
+    out
+      << "Performs a GEMM computation.\n"
+      << "\n"
+      << "Options:\n"
+      << "\n"
+      << "  --help                      If specified, displays this usage statement.\n\n"
+      << "  --m=<int>                   GEMM M dimension\n"
+      << "  --n=<int>                   GEMM N dimension\n"
+      << "  --k=<int>                   GEMM K dimension\n"
+      << "  --alpha=<f32>               Epilogue scalar alpha\n"
+      << "  --beta=<f32>                Epilogue scalar beta\n\n"
+      << "  --split=<int>               Split-K factor to emulate\n\n"
+      << "  --iterations=<int>          Number of profiling iterations to perform.\n\n";
+
+    out
+      << "\n\nExamples:\n\n"
+      << "$ " << command_name << " --m=1024 --n=512 --k=1024 --alpha=2 --beta=0.707 \n\n";
+
+    return out;
+  }
+
+  /// Compute performance in GFLOP/s
+  double gflops(double runtime_s) const
+  {
+    // Two flops per multiply-add
+    return 2.0 * double(problem_size.product()) / double(1.0e9) / runtime_s;
+  }
+};
+
+
+typename DeviceGemmTest::Arguments args_from_options(
+  const DeviceGemmTest &device_gemm,
+  const Options & options,
+  cutlass::HostTensor<ElementA, LayoutA> &tensor_a,
+  cutlass::HostTensor<ElementB, LayoutB> &tensor_b,
+  cutlass::HostTensor<ElementC, LayoutC> &tensor_c,
+  cutlass::HostTensor<ElementC, LayoutC> &tensor_d) {
+  return typename DeviceGemmTest::Arguments(
+    cutlass::gemm::GemmUniversalMode::kGemm,  // universal mode
+    options.problem_size,                     // problem_size
+    options.split_k_factor,                   // batch count / splitk slices
+    {                                         // epilogue parameters
+      ElementAccumulator(options.alpha),
+      ElementAccumulator(options.beta)
+    },
+    tensor_a.device_data(),                   // ptr_A
+    tensor_b.device_data(),                   // ptr_B
+    tensor_c.device_data(),                   // ptr_C
+    tensor_d.device_data(),                   // ptr_D
+    options.problem_size.mk().product(),      // batch_stride_A
+    options.problem_size.nk().product(),      // batch_stride_B
+    options.problem_size.mn().product(),      // batch_stride_C
+    options.problem_size.mn().product(),      // batch_stride_D
+    tensor_a.layout().stride(0),              // stride_a
+    tensor_b.layout().stride(0),              // stride_b
+    tensor_c.layout().stride(0),              // stride_c
+    tensor_d.layout().stride(0));             // stride_d
+}
+
+template <typename DeviceGemmT>
+Result run(std::string description, Options &options){
+  // Display test description
+  std::cout << std::endl << description << std::endl;
+  // Zero-initialize test output matrix D
+  cutlass::reference::host::TensorFill(options.tensor_d.host_view());
+  options.tensor_d.sync_device();
+  // Instantiate CUTLASS kernel depending on templates
+  DeviceGemmT device_gemm;
+  // Create a structure of gemm kernel arguments suitable for invoking an instance of DeviceGemmT
+  auto arguments = args_from_options(device_gemm, options, options.tensor_a, options.tensor_b, options.tensor_c, options.tensor_d);
+  // Using the arguments, query for extra workspace required for matrix multiplication computation
+  size_t workspace_size = DeviceGemmT::get_workspace_size(arguments);
+  // Allocate workspace memory
+  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+  // Check the problem size is supported or not
+  CUTLASS_CHECK(device_gemm.can_implement(arguments));
+  // Initialize CUTLASS kernel with arguments and workspace pointer
+  CUTLASS_CHECK(device_gemm.initialize(arguments, workspace.get()));
+  // Correctness / Warmup iteration
+  CUTLASS_CHECK(device_gemm());
+  // Copy output data from CUTLASS and reference kernel to host for comparison
+  options.tensor_d.sync_host();
+  // Check if output from CUTLASS kernel and reference kernel are equal or not
+  Result result;
+  result.passed = cutlass::reference::host::TensorEquals(
+    options.tensor_d.host_view(),
+    options.tensor_ref_d.host_view());
+
+  std::cout << "  Disposition: " << (result.passed ? "Passed" : "Failed") << std::endl;
+
+  // Run profiling loop
+  if (options.iterations > 0)
+  {
+    GpuTimer timer;
+    timer.start();
+    for (int iter = 0; iter < options.iterations; ++iter) {
+      CUTLASS_CHECK(device_gemm());
+    }
+    timer.stop();
+
+    // Compute average runtime and GFLOPs.
+    float elapsed_ms = timer.elapsed_millis();
+    result.avg_runtime_ms = double(elapsed_ms) / double(options.iterations);
+    result.gflops = options.gflops(result.avg_runtime_ms / 1000.0);
+
+    std::cout << "  Avg runtime: " << result.avg_runtime_ms << " ms" << std::endl;
+    std::cout << "  GFLOPs: " << result.gflops << std::endl;
+  }
+
+  if (!result.passed) {
+    exit(-1);
+  }
+
+  return result;
+}
+
+
+
+
+int main(int argc, char const **argv)
+{
+  // int m = 5120;
+  // if (argc >= 2)
+  //   sscanf(argv[1], "%d", &m);
+
+  // int n = 5120;
+  // if (argc >= 3)
+  //   sscanf(argv[2], "%d", &n);
+
+  // int k = 4096;
+  // if (argc >= 4)
+  //   sscanf(argv[3], "%d", &k);
+
+  // test_gemm(m, n, k);
+
+  // Current device must must have compute capability at least 80
+  cudaDeviceProp props;
+  int current_device_id;
+  CUDA_CHECK(cudaGetDevice(&current_device_id));
+  CUDA_CHECK(cudaGetDeviceProperties(&props, current_device_id));
+  if (!((props.major * 10 + props.minor) >= 80))
+  {
+    std::cerr << "Ampere Tensor Core operations must be run on a machine with compute capability at least 80."
+              << std::endl;
+
+    // Returning zero so this test passes on older Toolkits. Its actions are no-op.
+    return 0;
+  }
+#if 1
+  std::cout << "gpu major:" << props.major << std::endl;
+#endif
+
+  // Parse options
+  Options options("ampere_gemm");
+  options.parse(argc, argv);
+
+  if (options.help) {
+    options.print_usage(std::cout) << std::endl;
+    return 0;
+  }
+
+  std::cout <<
+    options.iterations << " timing iterations of " <<
+    options.problem_size.m() << " x " <<
+    options.problem_size.n() << " x " <<
+    options.problem_size.k() << " matrix-matrix multiply" << std::endl;
+
+  if (!options.valid()) {
+    std::cerr << "Invalid problem." << std::endl;
+    return -1;
+  }
+
+  // The KernelHardwareInfo struct holds the number of SMs on the GPU with a given device ID. This
+  // information is used by the underlying kernel.
+  cutlass::KernelHardwareInfo hw_info;
+
+  // Change device_id to another value if you are running on a machine with multiple GPUs and wish
+  // to use a GPU other than that with device ID 0.
+  hw_info.device_id = 0;
+  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+  #if 1
+  std::cout << hw_info.sm_count << std::endl;
+  #endif
+
+  // Build up gemm and run
+
+  // Initialize tensors using CUTLASS helper functions
+  options.tensor_a.resize(options.problem_size.mk());       // <- Create matrix A with dimensions M x K
+  options.tensor_b.resize(options.problem_size.kn());       // <- Create matrix B with dimensions K x N
+  options.tensor_c.resize(options.problem_size.mn());       // <- Create matrix C with dimensions M x N
+  options.tensor_d.resize(options.problem_size.mn());       // <- Create matrix D with dimensions M x N used to store output from CUTLASS kernel
+  options.tensor_ref_d.resize(options.problem_size.mn());   // <- Create matrix D with dimensions M x N used to store output from reference kernel
+
+  // Fill matrix A on host with uniform-random data [-2, 2]
+  cutlass::reference::host::TensorFillRandomUniform(
+      options.tensor_a.host_view(),
+      1,
+      ElementA(2),
+      ElementA(-2),
+      0);
+
+  // Fill matrix B on host with uniform-random data [-2, 2]
+  cutlass::reference::host::TensorFillRandomUniform(
+      options.tensor_b.host_view(),
+      1,
+      ElementB(2),
+      ElementB(-2),
+      0);
+
+  // Fill matrix C on host with uniform-random data [-2, 2]
+  cutlass::reference::host::TensorFillRandomUniform(
+      options.tensor_c.host_view(),
+      1,
+      ElementC(2),
+      ElementC(-2),
+      0);
+
+  // Copy data from host to GPU
+  options.tensor_a.sync_device();
+  options.tensor_b.sync_device();
+  options.tensor_c.sync_device();
+  // Zero-initialize reference output matrix D
+  cutlass::reference::host::TensorFill(options.tensor_ref_d.host_view());
+  options.tensor_ref_d.sync_device();
+
+  // Create instantiation for device reference gemm kernel
+  DeviceGemmReference gemm_reference;
+  // Launch device reference gemm kernel
+  gemm_reference(
+    options.problem_size,
+    ElementAccumulator(options.alpha),
+    options.tensor_a.device_ref(),
+    options.tensor_b.device_ref(),
+    ElementAccumulator(options.beta),
+    options.tensor_c.device_ref(),
+    options.tensor_ref_d.device_ref());
+  // Wait for kernels to finish
+  CUDA_CHECK(cudaDeviceSynchronize());
+  // Copy output data from reference kernel to host for comparison
+  options.tensor_ref_d.sync_host();
+
+  Result gemm_test_res = run<DeviceGemmTest>("Device gemm from profiler", options);
+  printf("Done\n");
 
   return 0;
 }
